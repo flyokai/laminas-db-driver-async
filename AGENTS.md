@@ -1,5 +1,7 @@
 # flyokai/laminas-db-driver-async
 
+> User docs → [`README.md`](README.md) · Agent quick-ref → [`CLAUDE.md`](CLAUDE.md) · Agent deep dive → [`AGENTS.md`](AGENTS.md)
+
 Dual-strategy async database driver for Laminas DB: PDO via AMPHP worker pools and MySQLi via Revolt event loop.
 
 ## Architecture
