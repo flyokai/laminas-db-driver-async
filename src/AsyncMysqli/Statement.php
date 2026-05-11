@@ -86,6 +86,10 @@ class Statement extends \Laminas\Db\Adapter\Driver\Mysqli\Statement
             ]
         );
         $triesCount = 0;
+        // Debug instrumentation — time each query and warn on slow ones. Logs to error_log
+        // (cluster-stderr.log) to avoid coupling to a particular PSR-3 logger here.
+        $queryStartedAt = microtime(true);
+        $fiberId = \Fiber::getCurrent() !== null ? spl_object_id(\Fiber::getCurrent()) : 0;
         do {
             $retry = false;
             try {
@@ -109,6 +113,16 @@ class Statement extends \Laminas\Db\Adapter\Driver\Mysqli\Statement
 
                 $result = $suspension->suspend();
 
+                $elapsed = microtime(true) - $queryStartedAt;
+                if ($elapsed > 1.0) {
+                    error_log(sprintf(
+                        '[slow-query] %.2fs fiber=%d pid=%d sql=%s',
+                        $elapsed,
+                        $fiberId,
+                        getmypid(),
+                        substr(preg_replace('/\s+/', ' ', $this->bindedSql), 0, 200),
+                    ));
+                }
             } catch (\mysqli_sql_exception $throwable) {
                 if ($triesCount < Connection::MAX_CONNECTION_RETRIES
                     && in_array($throwable->getCode(), $retryErrors)

@@ -83,9 +83,76 @@ class LinkPool
         return $this->idleLinks->count();
     }
 
+    /** @var array<int, array{acquired_at: float, fiber_id: int, trace: string}> */
+    private array $acquired = [];
+    private int $serial = 0;
+
     public function getLink(): PooledLink
     {
-        return new PooledLink($this->pull(), $this->push);
+        $link = $this->pull();
+        $serial = ++$this->serial;
+        $acquiredAt = microtime(true);
+        $fiberId = \Fiber::getCurrent() !== null ? spl_object_id(\Fiber::getCurrent()) : 0;
+        $trace = $this->formatTrace(debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 16));
+        $acquired = &$this->acquired;
+        $onRelease = static function () use (&$acquired, $serial): void {
+            unset($acquired[$serial]);
+        };
+        $this->acquired[$serial] = [
+            'acquired_at' => $acquiredAt,
+            'fiber_id' => $fiberId,
+            'trace' => $trace,
+        ];
+        return new PooledLink($link, $this->push, $onRelease);
+    }
+
+    private function formatTrace(array $frames): string
+    {
+        $out = [];
+        foreach ($frames as $f) {
+            $func = ($f['class'] ?? '') . ($f['type'] ?? '') . ($f['function'] ?? '');
+            $loc = isset($f['file']) ? basename($f['file']) . ':' . ($f['line'] ?? '?') : '<internal>';
+            $out[] = $func . ' (' . $loc . ')';
+        }
+        return implode(' <- ', $out);
+    }
+
+    /**
+     * Debug snapshot — used by the on-demand pool-state HTTP endpoint and by the slow-wait logger.
+     * @return array<string, int>
+     */
+    public function snapshot(): array
+    {
+        return [
+            'limit' => $this->limit,
+            'in_use' => $this->linkStorage->count(),
+            'pending_create' => $this->pendingCount,
+            'idle' => $this->idleLinks->count(),
+            'waiting' => $this->waiting->count(),
+            'tracked_acquires' => count($this->acquired),
+        ];
+    }
+
+    /**
+     * Per-acquire snapshot — returns one entry per currently-held link, with the call site
+     * that acquired it and how long it's been held.
+     *
+     * @return array<int, array{age_s: float, fiber_id: int, trace: string}>
+     */
+    public function acquireTrace(): array
+    {
+        $now = microtime(true);
+        $out = [];
+        foreach ($this->acquired as $serial => $entry) {
+            $out[$serial] = [
+                'age_s' => round($now - $entry['acquired_at'], 3),
+                'fiber_id' => $entry['fiber_id'],
+                'trace' => $entry['trace'],
+            ];
+        }
+        // Oldest first — those are the leak suspects.
+        uasort($out, static fn($a, $b) => $b['age_s'] <=> $a['age_s']);
+        return $out;
     }
 
     /**
@@ -102,6 +169,46 @@ class LinkPool
                 /** @var DeferredFuture<MysqliConnection|null> $deferredFuture */
                 $deferredFuture = new DeferredFuture;
                 $this->waiting->enqueue($deferredFuture);
+
+                // Debug instrumentation — flag suspensions when the pool is at limit, so we can
+                // tell whether the periodic OAuth hang is correlated with pool saturation.
+                $waitingBecauseSaturated = $this->getLinksCount() >= $this->limit;
+                $fiberId = \Fiber::getCurrent() !== null ? spl_object_id(\Fiber::getCurrent()) : 0;
+                $waitStartedAt = microtime(true);
+                $slowTimer = null;
+                if ($waitingBecauseSaturated) {
+                    error_log(sprintf(
+                        '[link-pool] WAIT_SATURATED fiber=%d pid=%d snapshot=%s',
+                        $fiberId,
+                        getmypid(),
+                        json_encode($this->snapshot()),
+                    ));
+                    // Dump the full acquire trace ONCE the FIRST time we saturate (per pool
+                    // instance) — that's the moment we want to know which call sites are
+                    // holding the leaked links.
+                    static $traceDumped = false;
+                    if (!$traceDumped) {
+                        $traceDumped = true;
+                        foreach ($this->acquireTrace() as $serial => $entry) {
+                            error_log(sprintf(
+                                '[link-pool] LEAK_TRACE serial=%d age=%.1fs fiber=%d trace=%s',
+                                $serial,
+                                $entry['age_s'],
+                                $entry['fiber_id'],
+                                $entry['trace'],
+                            ));
+                        }
+                    }
+                    $snapshotFn = $this->snapshot(...);
+                    $slowTimer = \Revolt\EventLoop::delay(2.0, static function () use ($fiberId, $waitStartedAt, $snapshotFn): void {
+                        error_log(sprintf(
+                            '[link-pool] SLOW_WAIT fiber=%d elapsed=%.2fs snapshot=%s',
+                            $fiberId,
+                            microtime(true) - $waitStartedAt,
+                            json_encode($snapshotFn()),
+                        ));
+                    });
+                }
 
                 if ($this->getLinksCount() < $this->limit) {
                     // Max ObjectManager count has not been reached, so create another.
@@ -139,6 +246,9 @@ class LinkPool
                 }
 
                 $link = $deferredFuture->getFuture()->await();
+                if ($slowTimer !== null) {
+                    \Revolt\EventLoop::cancel($slowTimer);
+                }
             } else {
                 $link = $this->idleLinks->shift();
             }
