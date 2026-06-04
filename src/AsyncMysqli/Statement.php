@@ -2,6 +2,7 @@
 
 namespace Flyokai\LaminasDbDriverAsync\AsyncMysqli;
 
+use Flyokai\LaminasDbDriverAsync\Prof;
 use Laminas\Db\Adapter\Driver\Mysqli\Mysqli;
 use Laminas\Db\Adapter\Exception;
 use Laminas\Db\Adapter\ParameterContainer;
@@ -22,6 +23,7 @@ class Statement extends \Laminas\Db\Adapter\Driver\Mysqli\Statement
 
     public function execute($parameters = null)
     {
+        $__profBuildStart = \microtime(true);
         if (! $this->isPrepared) {
             $this->prepare();
         }
@@ -49,6 +51,10 @@ class Statement extends \Laminas\Db\Adapter\Driver\Mysqli\Statement
 
         if ($this->profiler) {
             $this->profiler->profilerStart($this);
+        }
+
+        if (Prof::$on) {
+            Prof::add('drv.build', (\microtime(true) - $__profBuildStart) * 1e6);
         }
 
         $result = $this->executeWithRetry();
@@ -111,9 +117,15 @@ class Statement extends \Laminas\Db\Adapter\Driver\Mysqli\Statement
                     }
                 );
 
-                $result = $suspension->suspend();
+                Prof::enter();
+                try {
+                    $result = $suspension->suspend();
+                } finally {
+                    Prof::leave();
+                }
 
                 $elapsed = microtime(true) - $queryStartedAt;
+                Prof::add('drv.wait', $elapsed * 1e6);
                 if ($elapsed > 1.0) {
                     error_log(sprintf(
                         '[slow-query] %.2fs fiber=%d pid=%d sql=%s',
@@ -223,13 +235,36 @@ class Statement extends \Laminas\Db\Adapter\Driver\Mysqli\Statement
             }
         }
 
-        uksort($named, fn($a, $b) => strlen($b) <=> strlen($a));
-
         $sqlArr = explode('?', $this->sql);
         $bindedSqlArr = [];
-        foreach ($sqlArr as $__sql) {
-            $bindedSqlArr[] = str_replace(array_keys($named), array_values($named), $__sql);
-            $bindedSqlArr[] = (string)array_shift($positioned);
+
+        // Interleave positioned values by index. NB: array_shift() in this loop is
+        // O(n^2) — with a 500-row bulk INSERT carrying ~15k '?' placeholders that
+        // dominated CPU and serialised every batch fiber (no await during the build,
+        // so the loop blocks the whole event loop). An index pointer is O(n).
+        $posCount = count($positioned);
+        if (empty($named)) {
+            // All-positional fast path (the bulk INSERT/SELECT case): no per-segment
+            // str_replace, no array_keys/array_values rebuilt 15k times.
+            $i = 0;
+            foreach ($sqlArr as $__sql) {
+                $bindedSqlArr[] = $__sql;
+                if ($i < $posCount) {
+                    $bindedSqlArr[] = (string) $positioned[$i++];
+                }
+            }
+        } else {
+            // Longest-key-first so ':foo10' is replaced before ':foo1'.
+            uksort($named, fn ($a, $b) => strlen($b) <=> strlen($a));
+            $namedKeys = array_keys($named);
+            $namedVals = array_values($named);
+            $i = 0;
+            foreach ($sqlArr as $__sql) {
+                $bindedSqlArr[] = str_replace($namedKeys, $namedVals, $__sql);
+                if ($i < $posCount) {
+                    $bindedSqlArr[] = (string) $positioned[$i++];
+                }
+            }
         }
 
         $this->bindedSql = implode('', $bindedSqlArr);

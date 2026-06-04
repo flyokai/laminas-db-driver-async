@@ -5,7 +5,7 @@
         "php": "^8.1",
         "amphp/amp": "^3.0.2",
         "amphp/parallel": "^2.3.1",
-        "flyokai/laminas-db": "dev-dev@dev",
+        "flyokai/laminas-db": "^1",
         "ext-pdo": "*"
     },
     "license": [
