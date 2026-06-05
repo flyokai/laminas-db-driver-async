@@ -1,0 +1,284 @@
+<?php
+
+namespace Flyokai\LaminasDbDriverAsync\AsyncMysqli;
+
+use Flyokai\LaminasDbDriverAsync\Prof;
+use Laminas\Db\Adapter\Driver\Mysqli\Mysqli;
+use Laminas\Db\Adapter\Exception;
+use Laminas\Db\Adapter\ParameterContainer;
+use Revolt\EventLoop;
+use Laminas\Db\Adapter\Platform\Mysql as MysqlPlatform;
+
+class Statement extends \Laminas\Db\Adapter\Driver\Mysqli\Statement
+{
+    public function prepare($sql = null)
+    {
+        if ($this->isPrepared) {
+            throw new Exception\RuntimeException('This statement has already been prepared');
+        }
+
+        $this->isPrepared = true;
+        return $this;
+    }
+
+    public function execute($parameters = null)
+    {
+        $__profBuildStart = \microtime(true);
+        if (! $this->isPrepared) {
+            $this->prepare();
+        }
+
+        /** START Standard ParameterContainer Merging Block */
+        if (! $this->parameterContainer instanceof ParameterContainer) {
+            if ($parameters instanceof ParameterContainer) {
+                $this->parameterContainer = $parameters;
+                $parameters               = null;
+            } else {
+                $this->parameterContainer = new ParameterContainer();
+            }
+        }
+
+        if (is_array($parameters)) {
+            $this->parameterContainer->setFromArray($parameters);
+        }
+
+        if ($this->parameterContainer->count() > 0) {
+            $this->bindParametersFromContainer();
+        } else {
+            $this->bindedSql = $this->sql;
+        }
+        /** END Standard ParameterContainer Merging Block */
+
+        if ($this->profiler) {
+            $this->profiler->profilerStart($this);
+        }
+
+        if (Prof::$on) {
+            Prof::add('drv.build', (\microtime(true) - $__profBuildStart) * 1e6);
+        }
+
+        $result = $this->executeWithRetry();
+
+        if ($this->profiler) {
+            $this->profiler->profilerFinish();
+        }
+
+        if ($result === false) {
+            throw new Exception\RuntimeException(\mysqli_error($this->mysqli()));
+        }
+
+        if ($this->bufferResults === true) {
+            $this->resource->store_result();
+            $this->isPrepared = false;
+            $buffered         = true;
+        } else {
+            $buffered = false;
+        }
+
+        return $this->getDriver()->createResult($result===true ? $this->mysqli() : $result, $buffered);
+    }
+
+    private function executeWithRetry(): mixed
+    {
+        $result = false;
+        $connectionErrors = [
+            2006, // SQLSTATE[HY000]: General throwable: 2006 MySQL server has gone away
+            2013,  // SQLSTATE[HY000]: General throwable: 2013 Lost connection to MySQL server during query
+        ];
+        $retryErrors = array_merge(
+            $connectionErrors,
+            [
+                1213, // Deadlock found when trying to get lock; try restarting transaction
+            ]
+        );
+        $triesCount = 0;
+        // Debug instrumentation — time each query and warn on slow ones. Logs to error_log
+        // (cluster-stderr.log) to avoid coupling to a particular PSR-3 logger here.
+        $queryStartedAt = microtime(true);
+        $fiberId = \Fiber::getCurrent() !== null ? spl_object_id(\Fiber::getCurrent()) : 0;
+        do {
+            $retry = false;
+            try {
+                //$result = $this->mysqli()->query($this->bindedSql);
+                //var_dump($this->bindedSql);
+                $this->getConnection()->query($this->bindedSql, \MYSQLI_ASYNC);
+
+                $suspension = EventLoop::getSuspension();
+
+                EventLoop::onMysqli(
+                    $this->mysqli(),
+                    static function (string $callbackId, \mysqli $link) use ($suspension) {
+                        \Revolt\EventLoop::cancel($callbackId);
+                        try {
+                            $suspension->resume($link->reap_async_query());
+                        } catch (\Throwable $throwable) {
+                            $suspension->throw($throwable);
+                        }
+                    }
+                );
+
+                Prof::enter();
+                try {
+                    $result = $suspension->suspend();
+                } finally {
+                    Prof::leave();
+                }
+
+                $elapsed = microtime(true) - $queryStartedAt;
+                Prof::add('drv.wait', $elapsed * 1e6);
+                if ($elapsed > 1.0) {
+                    error_log(sprintf(
+                        '[slow-query] %.2fs fiber=%d pid=%d sql=%s',
+                        $elapsed,
+                        $fiberId,
+                        getmypid(),
+                        substr(preg_replace('/\s+/', ' ', $this->bindedSql), 0, 200),
+                    ));
+                }
+            } catch (\mysqli_sql_exception $throwable) {
+                if ($triesCount < Connection::MAX_CONNECTION_RETRIES
+                    && in_array($throwable->getCode(), $retryErrors)
+                ) {
+                    $retry = true;
+                    $triesCount++;
+                    if (in_array($throwable->getCode(), $connectionErrors)) {
+                        $this->getConnection()->getParentConnection()->reConnect();
+                    }
+                }
+
+                if (!$retry) {
+                    throw new Exception\RuntimeException($throwable->getMessage(), previous: $throwable);
+                }
+            }
+        } while ($retry);
+
+        return $result;
+    }
+
+    /**
+     * @var \WeakReference<Connection>
+     */
+    protected \WeakReference $connection;
+    public function asyncInitialize(Connection $connection): self
+    {
+        $this->connection = \WeakReference::create($connection);
+        return $this;
+    }
+
+    protected function getConnection(): Connection
+    {
+        return $this->connection->get();
+    }
+
+    protected function mysqli(): \mysqli
+    {
+        return $this->connection->get()->getResource();
+    }
+
+    public function initialize(\mysqli $mysqli)
+    {
+        throw new Exception\RuntimeException(__METHOD__.' not supported');
+    }
+
+    public function setResource(\mysqli_stmt $mysqliStatement)
+    {
+        throw new Exception\RuntimeException(__METHOD__.' not supported');
+    }
+
+    protected MysqlPlatform $platform;
+    public function getPlatform(): MysqlPlatform
+    {
+        if (!isset($this->platform)) {
+            $this->platform = new MysqlPlatform($this->getDriver());
+        }
+        return $this->platform;
+    }
+
+    protected $bindedSql = '';
+    protected function bindParametersFromContainer()
+    {
+        $parameters = $this->parameterContainer->getNamedArray();
+        $type       = '';
+        $named      = [];
+        $positioned = [];
+
+        foreach ($parameters as $name => $value) {
+            if ($this->parameterContainer->offsetHasErrata($name)) {
+                switch ($this->parameterContainer->offsetGetErrata($name)) {
+                    case ParameterContainer::TYPE_DOUBLE:
+                        $value = floatval($value);
+                        break;
+                    case ParameterContainer::TYPE_NULL:
+                        $value = 'NULL'; // as per @see http://www.php.net/manual/en/mysqli-stmt.bind-param.php#96148
+                    case ParameterContainer::TYPE_INTEGER:
+                        $value = intval($value);
+                        break;
+                    case ParameterContainer::TYPE_STRING:
+                    default:
+                        $value = $this->getPlatform()->quoteValue(strval($value));
+                        break;
+                }
+            } else {
+                if ($value === null) {
+                    $value = 'NULL';
+                } elseif (is_bool($value)) {
+                    $value = intval($value);
+                } elseif (!is_int($value) && !is_float($value)) {
+                    $value = $this->getPlatform()->quoteValue(strval($value));
+                }
+            }
+            if (is_int($name)) {
+                $positioned[] = $value;
+            } else {
+                $name = str_starts_with($name, ':') ? $name : ':'.$name;
+                $named[$name] = $value;
+            }
+        }
+
+        $sqlArr = explode('?', $this->sql);
+        $bindedSqlArr = [];
+
+        // Interleave positioned values by index. NB: array_shift() in this loop is
+        // O(n^2) — with a 500-row bulk INSERT carrying ~15k '?' placeholders that
+        // dominated CPU and serialised every batch fiber (no await during the build,
+        // so the loop blocks the whole event loop). An index pointer is O(n).
+        $posCount = count($positioned);
+        if (empty($named)) {
+            // All-positional fast path (the bulk INSERT/SELECT case): no per-segment
+            // str_replace, no array_keys/array_values rebuilt 15k times.
+            $i = 0;
+            foreach ($sqlArr as $__sql) {
+                $bindedSqlArr[] = $__sql;
+                if ($i < $posCount) {
+                    $bindedSqlArr[] = (string) $positioned[$i++];
+                }
+            }
+        } else {
+            // Longest-key-first so ':foo10' is replaced before ':foo1'.
+            uksort($named, fn ($a, $b) => strlen($b) <=> strlen($a));
+            $namedKeys = array_keys($named);
+            $namedVals = array_values($named);
+            $i = 0;
+            foreach ($sqlArr as $__sql) {
+                $bindedSqlArr[] = str_replace($namedKeys, $namedVals, $__sql);
+                if ($i < $posCount) {
+                    $bindedSqlArr[] = (string) $positioned[$i++];
+                }
+            }
+        }
+
+        $this->bindedSql = implode('', $bindedSqlArr);
+    }
+
+    public function setDriver(Mysqli $driver)
+    {
+        $this->driver = \WeakReference::create($driver);
+        return $this;
+    }
+
+    public function getDriver(): Mysqli
+    {
+        return $this->driver->get();
+    }
+
+}

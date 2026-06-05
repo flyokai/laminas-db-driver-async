@@ -1,0 +1,23 @@
+{
+    "name": "flyokai/laminas-db-driver-async",
+    "description": "Async driver for laminas db",
+    "require": {
+        "php": "^8.1",
+        "amphp/amp": "^3.0.2",
+        "amphp/parallel": "^2.3.1",
+        "flyokai/laminas-db": "^1",
+        "flyokai/revolt-event-loop": "^1",
+        "ext-pdo": "*"
+    },
+    "license": [
+        "MIT"
+    ],
+    "autoload": {
+        "files": [
+            "src/functions.php"
+        ],
+        "psr-4": {
+            "Flyokai\\LaminasDbDriverAsync\\": "src/"
+        }
+    }
+}
